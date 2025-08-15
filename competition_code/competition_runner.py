@@ -120,33 +120,34 @@ async def evaluate_solution(
     
     # Spawn vehicle and sensors to receive data
     waypoints = world.maneuverable_waypoints
+    yaw_vector = waypoints[1].location - waypoints[0].location
+    initial_yaw = np.arctan2(yaw_vector[1], yaw_vector[0])
+    initial_rpy = np.array([0, 0, initial_yaw])
+
     vehicle = world.spawn_vehicle(
-        "vehicle.tesla.model3",
-        waypoints[0].location + np.array([0,0,1]),
-        waypoints[0].roll_pitch_yaw,
-        True,
+        "vehicle.audi.tt",
+        waypoints[0].location + np.array([0, 0, 2.5]),
+        initial_rpy,  # ← aligned with path
+        True
     )
+
+
     assert vehicle is not None
+
+    print(f" Vehicle spawned: {vehicle}")
+    
     camera = vehicle.attach_camera_sensor(
         roar_py_interface.RoarPyCameraSensorDataRGB,
-        np.array([-2.0 * vehicle.bounding_box.extent[0], 0.0, 3.0 * vehicle.bounding_box.extent[2]]), # relative position
-        np.array([0, 10/180.0*np.pi, 0]), # relative rotation
+        np.array([-2.0 * vehicle.bounding_box.extent[0], 0.0, 3.0 * vehicle.bounding_box.extent[2]]),
+        np.array([0, 10/180.0*np.pi, 0]),
         image_width=1024,
         image_height=768
     )
     location_sensor = vehicle.attach_location_in_world_sensor()
     velocity_sensor = vehicle.attach_velocimeter_sensor()
     rpy_sensor = vehicle.attach_roll_pitch_yaw_sensor()
-    occupancy_map_sensor = vehicle.attach_occupancy_map_sensor(
-        50,
-        50,
-        2.0,
-        2.0
-    )
-    collision_sensor = vehicle.attach_collision_sensor(
-        np.zeros(3),
-        np.zeros(3)
-    )
+    occupancy_map_sensor = vehicle.attach_occupancy_map_sensor(50, 50, 2.0, 2.0)
+    collision_sensor = vehicle.attach_collision_sensor(np.zeros(3), np.zeros(3))
 
     assert camera is not None
     assert location_sensor is not None
@@ -156,7 +157,6 @@ async def evaluate_solution(
     assert collision_sensor is not None
 
 
-    # Start to run solution 
     solution : RoarCompetitionSolution = solution_constructor(
         waypoints,
         RoarCompetitionAgentWrapper(vehicle),
@@ -167,40 +167,31 @@ async def evaluate_solution(
         occupancy_map_sensor,
         collision_sensor
     )
-    rule = RoarCompetitionRule(waypoints * 3,vehicle,world) # 3 laps
+
+    rule = RoarCompetitionRule(waypoints * 3, vehicle, world) # 3 laps
 
     for _ in range(20):
         await world.step()
     
     rule.initialize_race()
-    # vehicle.close()
-    # exit()
 
-    # Timer starts here 
     start_time = world.last_tick_elapsed_seconds
     current_time = start_time
     await vehicle.receive_observation()
     await solution.initialize()
 
-    
     while True:
-        # terminate if time out
         current_time = world.last_tick_elapsed_seconds
         if current_time - start_time > max_seconds:
             vehicle.close()
             return None
         
-        # receive sensors' data
         await vehicle.receive_observation()
-
         await rule.tick()
 
-        # terminate if there is major collision
         collision_impulse_norm = np.linalg.norm(collision_sensor.get_last_observation().impulse_normal)
         if collision_impulse_norm > 100.0:
-            # vehicle.close()
-            print(f"major collision of tensity {collision_impulse_norm}")
-            # return None
+            print(f"Major collision! Intensity: {collision_impulse_norm:.2f}")
             await rule.respawn()
         
         if rule.lap_finished():
@@ -214,7 +205,7 @@ async def evaluate_solution(
         await solution.step()
         await world.step()
     
-    print("end of the loop")
+    print("🏁 End of the loop")
     end_time = world.last_tick_elapsed_seconds
     vehicle.close()
     if enable_visualization:
@@ -223,6 +214,7 @@ async def evaluate_solution(
     return {
         "elapsed_time" : end_time - start_time,
     }
+
 
 async def main():
     carla_client = carla.Client('127.0.0.1', 2000)
