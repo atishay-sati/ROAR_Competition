@@ -1,23 +1,23 @@
+"""
+Competition instructions:
+Please do not change anything else but fill out the to-do sections.
+"""
 print("submission.py loaded")
 
-from typing import List
+from typing import List, Tuple, Dict, Optional
 import roar_py_interface
 import numpy as np
 
-
 def normalize_rad(rad: float):
-    """Normalize angle to [-pi, pi)."""
     return (rad + np.pi) % (2 * np.pi) - np.pi
 
-
 def filter_waypoints(location: np.ndarray, current_idx: int, waypoints: List[roar_py_interface.RoarPyWaypoint]) -> int:
-    loc2d = location[:2]
-    for i in range(current_idx, current_idx + len(waypoints)):
-        wp = waypoints[i % len(waypoints)]
-        if np.linalg.norm(loc2d - wp.location[:2]) < 3:
+    def dist_to_waypoint(waypoint: roar_py_interface.RoarPyWaypoint):
+        return np.linalg.norm(location[:2] - waypoint.location[:2])
+    for i in range(current_idx, len(waypoints) + current_idx):
+        if dist_to_waypoint(waypoints[i % len(waypoints)]) < 3:
             return i % len(waypoints)
     return current_idx
-
 
 class RoarCompetitionSolution:
     def __init__(
@@ -49,77 +49,86 @@ class RoarCompetitionSolution:
         self._last_yaw = None
         self._last_dt = 0.05
 
+        print("EFGIEUHJGOSHJGEOIGJEIOGJIOSJEISJGSGJGJEJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJIOGJI")
+
         vehicle_location = self.location_sensor.get_last_gym_observation()
         vehicle_rotation = self.rpy_sensor.get_last_gym_observation()
-        heading = np.array([np.cos(vehicle_rotation[2]), np.sin(vehicle_rotation[2])])
+        vehicle_heading = np.array([np.cos(vehicle_rotation[2]), np.sin(vehicle_rotation[2])])
 
-        # Pick closest waypoint in front
-        best_idx, min_cost = 0, np.inf
+        # Pick a waypoint that is close and in front
+        min_cost = np.inf
+        best_idx = 0
         for i, wp in enumerate(self.maneuverable_waypoints):
-            vec = wp.location[:2] - vehicle_location[:2]
-            if np.dot(vec, heading) > 0:  # in front
-                dist = np.linalg.norm(vec)
-                if dist < min_cost:
-                    min_cost, best_idx = dist, i
+            vec_to_wp = wp.location[:2] - vehicle_location[:2]
+            if np.dot(vec_to_wp, vehicle_heading) > 0:  # in front
+                cost = np.linalg.norm(vec_to_wp)
+                if cost < min_cost:
+                    min_cost = cost
+                    best_idx = i
+
         self.current_waypoint_idx = best_idx
 
     async def step(self) -> None:
         vehicle_location = self.location_sensor.get_last_gym_observation()
         vehicle_rotation = self.rpy_sensor.get_last_gym_observation()
-        v = float(np.linalg.norm(self.velocity_sensor.get_last_gym_observation()))
+        vehicle_velocity = self.velocity_sensor.get_last_gym_observation()
+        v = float(np.linalg.norm(vehicle_velocity))
         yaw = float(vehicle_rotation[2])
         pos_xy = vehicle_location[:2]
 
         if self._last_yaw is None:
             self._last_yaw = yaw
 
-        # Update to nearest waypoint
         self.current_waypoint_idx = filter_waypoints(
-            vehicle_location, self.current_waypoint_idx, self.maneuverable_waypoints
+            vehicle_location,
+            self.current_waypoint_idx,
+            self.maneuverable_waypoints
         )
 
-        # Collect waypoints ahead
-        num_fit_points, lookahead_distance = 10, 6.0
+        num_fit_points = 10
+        lookahead_distance = 6.0
         wp_xy = np.array([
             self.maneuverable_waypoints[(self.current_waypoint_idx + i) % len(self.maneuverable_waypoints)].location[:2]
             for i in range(num_fit_points)
         ])
-        print(f"Current idx: {self.current_waypoint_idx}, Waypoint: {wp_xy[0]}")
+        print(f"Current idx: {self.current_waypoint_idx}, Waypoint: {self.maneuverable_waypoints[self.current_waypoint_idx].location}")
 
-        # Transform into vehicle local frame
-        cos_y, sin_y = np.cos(-yaw), np.sin(-yaw)
-        rot = np.array([[cos_y, -sin_y], [sin_y, cos_y]])
+        rot = np.array([[np.cos(-yaw), -np.sin(-yaw)], [np.sin(-yaw), np.cos(-yaw)]])
         local_wp = (wp_xy - pos_xy) @ rot.T
 
-        # Prevent driving backwards
-        if sum(pt[0] > 0.5 for pt in local_wp) < len(local_wp) // 2:
+        #Prevent driving backwards: check majority of points in front
+        forward_points = [pt for pt in local_wp if pt[0] > 0.5]
+        if len(forward_points) < len(local_wp) // 2:
             print("Too many waypoints behind car — skipping step")
             return
 
-        # Quadratic fit
-        x, y = local_wp[:, 0], local_wp[:, 1]
+        x = local_wp[:, 0]
+        y = local_wp[:, 1]
         coeffs = np.polyfit(x, y, 2)
 
-        # Steering
-        y_target = np.polyval(coeffs, lookahead_distance)
+        x_target = lookahead_distance
+        y_target = np.polyval(coeffs, x_target)
         steer_angle = np.arctan2(2.0 * y_target, lookahead_distance)
         raw_steer = float(np.clip(steer_angle / 0.7, -1.0, 1.0))
-        self._prev_steer = (1 - self._steer_alpha) * self._prev_steer + self._steer_alpha * raw_steer
 
-        # Speed control
+        alpha = self._steer_alpha
+        steer_control = (1 - alpha) * self._prev_steer + alpha * raw_steer
+        self._prev_steer = steer_control
+
         curvature = abs(coeffs[0])
         target_speed = max(6.0, self._base_speed * (1.0 - 10.0 * curvature))
-        accel = 0.10 * (target_speed - v)
+        speed_error = target_speed - v
+        accel = 0.10 * speed_error
         throttle = np.clip(accel, 0.0, 1.0)
         brake = np.clip(-accel, 0.0, 1.0)
 
         control = {
             "throttle": throttle,
-            "steer": self._prev_steer,
+            "steer": steer_control,
             "brake": brake,
             "hand_brake": 0.0,
             "reverse": 0,
-            "target_gear": 0,
+            "target_gear": 0
         }
         await self.vehicle.apply_action(control)
         return control
